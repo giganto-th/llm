@@ -41,10 +41,10 @@ services:
       - --spec-draft-n-max
       - "4"
       # ── context / offload ────────────────────────────────
-      # 32K พอสำหรับ chat + PDF หลายหน้า (Gemma 4 support 256K)
+      # 128K รองรับ prompt ยาว/coding agent (Gemma 4 support ถึง 256K)
       # hybrid attention (sliding 1024) → KV cache เล็กกว่า dense ทั่วไป
       - -c
-      - "32768"
+      - "131072"
       # -ngl 999 = offload ทุก layer ไป GPU (ไม่มี CPU fallback)
       - -ngl
       - "999"

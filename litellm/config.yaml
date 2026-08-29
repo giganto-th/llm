@@ -44,7 +44,7 @@ litellm_settings:
   # ── default limits (fallback ถ้า key ไม่มี override) ──
   request_timeout: 600
   # max tokens ต่อ 1 request (กันขอ 200k tokens แล้ว hang GPU)
-  max_input_tokens: 30000
+  max_input_tokens: 120000
 
 general_settings:
   master_key: os.environ/LITELLM_MASTER_KEY

@@ -13,12 +13,11 @@
 - **Gateway + quota** — LiteLLM ออก virtual key ต่อ tier/แอป คุม budget รายวัน/เดือน + rate limit
 - **เรียกใช้จากข้างนอกได้** — `https://llm.example.com/v1` (OpenAI-compatible) ด้วย virtual key
 
-> **หมายเหตุ:** ComfyUI / image generation ถูก **ถอดออก** ด้วยเหตุผลด้านความปลอดภัย — ดู [Security](#security)
+> **หมายเหตุ:** image generation (ComfyUI) ถูก **ถอดออก** — stack นี้โฟกัสงาน text/vision
 
 ## สารบัญ
 
 - [สถาปัตยกรรม](#สถาปัตยกรรม)
-- [Security](#security)
 - [ความต้องการของระบบ](#ความต้องการของระบบ)
 - [โครงสร้างโปรเจกต์](#โครงสร้างโปรเจกต์)
 - [การติดตั้ง](#การติดตั้ง)
@@ -57,33 +56,6 @@ internet → nginx (llm.example.com :443)
 - **external API:** client → `https://llm.example.com/v1` + virtual key → LiteLLM → llama.cpp
 
 **ทำไมต้องใช้ image เฉพาะ?** — llama.cpp `server-cuda` build มาพร้อม CUDA รองรับ GB10 (sm_121a ผ่าน JIT); Gemma 4 31B รันแบบ **QAT Q4** (near-lossless, weights ~17.3GB) + **MTP** (drafter ~280MB) เร่งความเร็ว 1.5–2.2×
-
----
-
-## Security
-
-มาตรการด้านความปลอดภัยของ stack นี้:
-
-- 🔒 **ทุก container bind แค่ `127.0.0.1`** — คนนอกเข้า port ตรงไม่ได้ (litellm 4000 / openwebui 8002); llama + postgres = internal only เข้าได้แค่ผ่าน **nginx :443**
-- 🗑️ **ถอด ComfyUI ออกทั้งหมด** — ComfyUI รันโค้ดได้ (RCE risk สูง) + โดย default เปิด `0.0.0.0:8188` ไม่มี auth + รันเป็น root ถ้าจะใช้ image/video gen ในอนาคต **ต้องแยกเครื่อง/แยก network + non-root + auth + ไม่ expose**
-- 🔑 **แจกเฉพาะ virtual key** (มี budget/rate limit) ห้ามแจก `LITELLM_MASTER_KEY`
-- 👤 OWUI: ปิด local signup, บังคับ **Google OAuth** + admin approval (`DEFAULT_USER_ROLE=pending`)
-
-> **OWUI ถูก pin ที่ `v0.11.0`** — v0.11.1 มีบั๊ก OAuth+SQLite ("int too large to convert to SQLite INTEGER" เมื่อ Google `sub` เป็นเลข > 2^63) ทำให้ login ไม่ได้ อย่าเพิ่งอัปจนกว่า upstream จะแก้
-
-### Hardening checklist (ยังต้องทำ)
-
-- [x] bind ทุก port เป็น `127.0.0.1` (เข้าผ่าน nginx เท่านั้น)
-- [x] ถอด ComfyUI + ปิด OWUI image gen
-- [x] Google OAuth + admin approval
-- [ ] **rotate secrets ทั้งหมดใน `.env`** เป็นระยะ — ดู [Secrets rotation](#secrets-rotation)
-- [ ] **ufw firewall** เปิดแค่ 22/80/443 (แตะ firewall ผ่าน SSH ระวังตัดตัวเอง):
-  ```bash
-  sudo ufw default deny incoming && sudo ufw default allow outgoing
-  sudo ufw allow 22,80,443/tcp && sudo ufw enable
-  ```
-- [ ] **fail2ban** + ปิด SSH password auth (`PasswordAuthentication no` ใน `sshd_config`)
-- [ ] ตั้ง monitoring/alert — ดู [Monitoring](#monitoring)
 
 ---
 
@@ -238,7 +210,7 @@ curl https://llm.example.com/v1/chat/completions \
 
 ## Performance (วัดจริง)
 
-วัดบน DGX Spark GB10 — Gemma 4 31B QAT Q4_K_XL + MTP (n_max=4), 32K ctx, 1 request, 2026-08-28
+วัดบน DGX Spark GB10 — Gemma 4 31B QAT Q4_K_XL + MTP (n_max=4), 128K ctx, 1 request, 2026-08-28
 
 ### ความเร็ว (tokens/sec)
 
@@ -290,7 +262,7 @@ llama.cpp ตั้ง **`n_parallel=4`** (4 slots + continuous batching) — �
 - **จำนวน "ผู้ใช้แชท" รองรับได้มากกว่านั้นมาก** เพราะคนอ่าน/พิมพ์สลับกัน ไม่ได้ generate พร้อมกันตลอด → ประเมิน **~20-40 active users** สบายๆ
 - LiteLLM คุม **rpm ต่อ tier** อีกชั้น (admin 200 / user 30 / guest 10 req/min)
 
-**เพิ่ม concurrency:** ใส่ `--parallel 8` (หรือมากกว่า) ใน `llama` command — แต่ KV cache แชร์กัน (32K ÷ 8 = 4K/slot), ต่อ req ช้าลง, ใช้ memory เพิ่ม เหมาะถ้ามี user เยอะแต่ context สั้น
+**เพิ่ม concurrency:** ใส่ `--parallel 8` (หรือมากกว่า) ใน `llama` command — แต่ KV cache แชร์กัน (128K ÷ 8 = 16K/slot), ต่อ req ช้าลง, ใช้ memory เพิ่ม เหมาะถ้ามี user เยอะแต่ context สั้น
 
 ---
 
@@ -335,7 +307,7 @@ DGX Spark unified 128GB — ทุกอย่างแชร์ pool เดี�
 | ----------------------------- | ------------ | ------------------------------------------ |
 | Gemma 4 31B **QAT Q4** weights | ~17.3 GB    | near-lossless (ไม่ใช่ bf16 62GB)          |
 | MTP drafter                   | ~0.3 GB      | speculative decoding                       |
-| KV cache (32K context)        | ~10-18 GB    | hybrid attention → เล็กกว่า dense ทั่วไป   |
+| KV cache (128K context)       | ~3-6 GB      | hybrid attention → เล็กมาก (128K เพิ่มจาก 32K แค่ ~3GB) |
 | LiteLLM + Postgres + OWUI     | ~2-3 GB      |                                            |
 | OS + Docker + cache           | ~10-15 GB    | เผื่อไว้                                    |
 | **รวม**                       | **~45-55 GB**| เหลือ headroom เยอะ                        |

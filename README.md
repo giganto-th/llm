@@ -1,5 +1,11 @@
 # LLM Stack — Gemma 4 31B (DGX Spark GB10)
 
+![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)
+![Docker Compose](https://img.shields.io/badge/docker-compose-2496ED?logo=docker&logoColor=white)
+![Model: Gemma 4 31B QAT](https://img.shields.io/badge/model-Gemma%204%2031B%20QAT-4285F4)
+![Gateway: LiteLLM](https://img.shields.io/badge/gateway-LiteLLM-00A98F)
+![Frontend: Open WebUI](https://img.shields.io/badge/frontend-Open%20WebUI-000000)
+
 ระบบ Local LLM สำหรับ **NVIDIA DGX Spark (GB10 / Blackwell, ARM64, sm_121a)** — OpenAI-compatible API + หน้าเว็บแชท พร้อม budget/quota ต่อผู้ใช้
 
 - **Chat + tool calling** (Gemma 4 31B QAT + MTP speculative decoding)

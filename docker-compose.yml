@@ -1,0 +1,226 @@
+services:
+  # =========================================================
+  # llama.cpp server — Gemma 4 31B-it QAT (dense, unified multimodal)
+  # chat + tool calling + vision + MTP speculative decoding (1.5–2.2x faster)
+  #
+  # weights:   unsloth/gemma-4-31B-it-qat-GGUF:UD-Q4_K_XL   (~17.3 GB)
+  # drafter:   MTP/mtp-gemma-4-31B-it.gguf (Q4_0)           (~280 MB, auto)
+  #
+  # image: ggml-org official CUDA server build
+  # (GB10/sm_121a รองรับผ่าน CUDA JIT — ถ้าไม่ทำงาน สลับไป community build)
+  #
+  # NOTE: ไม่ publish port ออก host — ทุก traffic ผ่าน LiteLLM (budget/quota tracking)
+  # =========================================================
+  llama:
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda
+    container_name: llama
+    runtime: nvidia
+    ipc: host
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - HF_HOME=/root/.cache/huggingface
+      # Gemma 4 = Apache 2.0 ไม่ gated ปล่อยว่างได้
+      - HF_TOKEN=${HF_TOKEN:-}
+      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
+    command:
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      # target model (QAT Q4 — near-lossless, weights ~17.3 GB)
+      - -hf
+      - unsloth/gemma-4-31B-it-qat-GGUF:UD-Q4_K_XL
+      # alias — LiteLLM route ด้วยชื่อนี้ (ต้องตรงกับ config.yaml)
+      - -a
+      - gemma-4-31b
+      # ── MTP speculative decoding ─────────────────────────
+      # drafter model โหลดจาก MTP/ subfolder ใน HF repo อัตโนมัติ
+      # n_max=4: predict 4 tokens ล่วงหน้าต่อ step (Unsloth แนะนำ 2–6)
+      - --spec-type
+      - draft-mtp
+      - --spec-draft-n-max
+      - "4"
+      # ── context / offload ────────────────────────────────
+      # 32K พอสำหรับ chat + PDF หลายหน้า (Gemma 4 support 256K)
+      # hybrid attention (sliding 1024) → KV cache เล็กกว่า dense ทั่วไป
+      - -c
+      - "32768"
+      # -ngl 999 = offload ทุก layer ไป GPU (ไม่มี CPU fallback)
+      - -ngl
+      - "999"
+      # flash-attn ลด VRAM + เร็วขึ้นบน sm_121a
+      - -fa
+      - "on"
+      # ── multimodal (vision) ──────────────────────────────
+      # llama.cpp โหลด mmproj จาก HF repo อัตโนมัติเมื่อเจอ vision model
+      # ── tool calling ─────────────────────────────────────
+      # ใช้ Jinja template ของ Gemma 4 (มี tool-call syntax ในตัว)
+      - --jinja
+      # ── API key ──────────────────────────────────────────
+      # บังคับ Bearer token — LiteLLM ใช้ VLLM_API_KEY ผ่าน env เดียวกัน
+      - --api-key
+      - ${VLLM_API_KEY}
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      # 31B QAT: weights ~17.3 GB + drafter — โหลดครั้งแรกจาก HF ใช้เวลา
+      retries: 60
+      start_period: 10m
+    restart: unless-stopped
+    networks:
+      - llm-net
+
+  # =========================================================
+  # Postgres — LiteLLM tracking DB (spend, keys, teams, budgets)
+  #
+  # ไม่ publish port ออก host — คุยเฉพาะใน docker network llm-net
+  # ตั้งชื่อ container ให้ชัดว่าเป็นของ LiteLLM (กันชนกับ postgres อื่นบน host)
+  # =========================================================
+  litellm-postgres:
+    image: postgres:16-alpine
+    container_name: litellm-postgres
+    environment:
+      - POSTGRES_USER=litellm
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=litellm
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U litellm -d litellm"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+    networks:
+      - llm-net
+
+  # =========================================================
+  # LiteLLM Proxy — OpenAI-compatible gateway
+  #   - Virtual keys ต่อ team (Admin/User/Guest)
+  #   - Rate limit: TPM (tokens/min) + RPM (requests/min)
+  #   - Quota: max_budget (USD-equivalent, ผูกกับ input/output cost)
+  #   - Spend tracking + UI ที่ /ui
+  #
+  # หลัง start ครั้งแรก: รัน ./litellm/bootstrap.sh เพื่อสร้าง 3 teams
+  # =========================================================
+  litellm:
+    image: ghcr.io/berriai/litellm:main-stable
+    container_name: litellm
+    ports:
+      - "127.0.0.1:4000:4000"
+    environment:
+      - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY}
+      - LITELLM_SALT_KEY=${LITELLM_SALT_KEY}
+      - DATABASE_URL=postgresql://litellm:${POSTGRES_PASSWORD}@litellm-postgres:5432/litellm
+      - UI_USERNAME=admin
+      - UI_PASSWORD=${LITELLM_UI_PASSWORD}
+      - STORE_MODEL_IN_DB=True
+      # ผ่านต่อไปยัง llama-server
+      - VLLM_API_KEY=${VLLM_API_KEY}
+      # ── serve UI/API ใต้ subpath /litellm บนโดเมนหลัก ──
+      # litellm.example.com ไม่มี DNS → เข้าผ่าน https://llm.example.com/litellm แทน
+      - SERVER_ROOT_PATH=/litellm
+      - PROXY_BASE_URL=https://llm.example.com/litellm
+    volumes:
+      - ./litellm/config.yaml:/app/config.yaml:ro
+    command:
+      - --config=/app/config.yaml
+      - --port=4000
+      - --num_workers=1
+    depends_on:
+      litellm-postgres:
+        condition: service_healthy
+      # ไม่ block บน llama healthy (10min startup) — LiteLLM จะ error 503 จนกว่า llama พร้อม
+      llama:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:4000/litellm/health/liveliness || curl -sf http://localhost:4000/health/liveliness || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 2m
+    restart: unless-stopped
+    networks:
+      - llm-net
+
+  # =========================================================
+  # (ComfyUI ถูกถอดออก — ความเสี่ยงด้านความปลอดภัยสูง: รันโค้ดได้ (RCE),
+  #  โดย default เปิด :8188 ไม่มี auth + รันเป็น root)
+  #  ถ้าจะใช้ image/video generation ในอนาคต ให้รันแยกเครื่อง/แยก network
+  #  + non-root + cap_drop + auth + ไม่ expose ออกเน็ต
+  # =========================================================
+
+  # =========================================================
+  # Open WebUI — unified frontend
+  # chat/OCR: → LiteLLM (budget-tracked) → llama.cpp (Gemma 4 31B QAT + MTP)
+  # (image generation ปิด — ComfyUI ถูกถอดออก)
+  #
+  # Multi-tier setup: Admin เพิ่ม "Direct Connections" 3 อัน
+  # ต่อกับ LiteLLM แต่ละอันใช้ virtual key คนละ tier (Admin/User/Guest)
+  # แล้วผูก connection กับ user group ใน Admin > Settings > Users > Groups
+  # =========================================================
+  openwebui:
+    image: ghcr.io/open-webui/open-webui:v0.11.0
+    container_name: openwebui
+    ports:
+      - "127.0.0.1:8002:8080"
+    environment:
+      # public URL — สำคัญเมื่ออยู่หลัง reverse proxy
+      - WEBUI_URL=https://llm.example.com
+      # ── chat / OCR / vision ─────────────────────────────
+      # default connection ใช้ master key — Admin ใช้งาน + สร้าง group connections
+      - OPENAI_API_BASE_URL=http://litellm:4000/v1
+      - OPENAI_API_KEY=${LITELLM_MASTER_KEY}
+      # ── image generation ───────────────────────────────
+      # ปิด — ComfyUI ถูกถอดออก (ความเสี่ยง RCE)
+      - ENABLE_IMAGE_GENERATION=false
+      # ── RAG / PDF ────────────────────────────────────────
+      # ไฟล์เล็ก: โยนเต็มเข้า prompt แม่นกว่า chunked RAG
+      - BYPASS_EMBEDDING_AND_RETRIEVAL=true
+      # embedding รองรับไทย (เผื่อผู้ใช้เปิด RAG ทีหลัง)
+      - RAG_EMBEDDING_MODEL=BAAI/bge-m3
+      # PDF scan → แปลงหน้าเป็นภาพส่งเข้า Gemma 4 (native vision)
+      - PDF_EXTRACT_IMAGES=true
+      # ใช้ HF cache ร่วมกับ llama — bge-m3 โหลดครั้งเดียว
+      - HF_HOME=/root/.cache/huggingface
+      # ── Auth: Google OAuth + Admin approval ─────────────
+      # ปิด local signup (email/password) — บังคับใช้ Google เท่านั้น
+      - ENABLE_SIGNUP=false
+      - ENABLE_LOGIN_FORM=false
+      # เปิด OAuth signup — user ใหม่จะถูกสร้างอัตโนมัติเมื่อ Google login สำเร็จ
+      - ENABLE_OAUTH_SIGNUP=true
+      # ถ้ามี user (local) อยู่ก่อนที่ email เดียวกัน → merge เข้า Google account
+      - OAUTH_MERGE_ACCOUNTS_BY_EMAIL=true
+      # user ใหม่เข้าเป็น "pending" — admin ต้องกด approve ก่อนใช้งาน
+      # (Admin Panel → Users → เปลี่ยน role จาก pending → user แล้วผูก group)
+      - DEFAULT_USER_ROLE=pending
+      # ── Google OAuth ────────────────────────────────────
+      - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID}
+      - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET}
+      # redirect URI (ต้องใส่ตรงกันใน Google Cloud Console):
+      #   https://llm.example.com/oauth/google/callback
+      # จำกัด domain (optional): "example.com,partner.com" — ว่างไว้ = ทุก Google account
+      - OAUTH_ALLOWED_DOMAINS=${OAUTH_ALLOWED_DOMAINS:-*}
+      # scope ปกติ (openid + email + profile) — Open WebUI ตั้ง default ให้แล้ว
+      # session cookie ต้องเป็น secure หลัง https (proxy จาก nginx)
+      - WEBUI_SESSION_COOKIE_SECURE=true
+      - WEBUI_SESSION_COOKIE_SAME_SITE=lax
+    depends_on:
+      litellm:
+        condition: service_started
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
+      - openwebui-data:/app/backend/data
+    restart: unless-stopped
+    networks:
+      - llm-net
+
+volumes:
+  openwebui-data:
+  postgres-data:
+
+networks:
+  llm-net:
